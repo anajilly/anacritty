@@ -1,3 +1,7 @@
+You probably want alacritty here: https://github.com/alacritty/alacritty
+
+I made this fork to make a terminal that works the way I want it to.
+
 <p align="center">
     <img width="200" alt="Alacritty Logo" src="https://raw.githubusercontent.com/alacritty/alacritty/master/extra/logo/compat/alacritty-term%2Bscanlines.png">
 </p>
