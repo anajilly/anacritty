@@ -144,6 +144,13 @@ pub trait ActionContext<T: EventListener> {
         S: AsRef<OsStr>,
     {
     }
+    fn create_tab(&mut self) {}
+    fn close_tab(&mut self) {}
+    fn select_next_tab(&mut self) {}
+    fn select_previous_tab(&mut self) {}
+    fn select_tab_at_index(&mut self, _index: usize) {}
+    fn tab_count(&self) -> usize { 1 }
+    fn toggle_tab_bar(&mut self) {}
 }
 
 impl Action {
@@ -410,36 +417,99 @@ impl<T: EventListener> Execute<T> for Action {
             Action::CreateNewWindow => ctx.create_new_window(None),
             #[cfg(target_os = "macos")]
             Action::CreateNewTab => {
-                // Tabs on macOS are not possible without decorations.
+                // Native macOS tabs require decorations.
                 if ctx.config().window.decorations != Decorations::None {
                     let tabbing_id = Some(ctx.window().tabbing_id());
                     ctx.create_new_window(tabbing_id);
                 }
             },
             #[cfg(target_os = "macos")]
-            Action::SelectNextTab => ctx.window().select_next_tab(),
+            Action::SelectNextTab => {
+                ctx.window().select_next_tab();
+                ctx.select_next_tab();
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectPreviousTab => ctx.window().select_previous_tab(),
+            Action::SelectPreviousTab => {
+                ctx.window().select_previous_tab();
+                ctx.select_previous_tab();
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab1 => ctx.window().select_tab_at_index(0),
+            Action::SelectTab1 => {
+                ctx.window().select_tab_at_index(0);
+                ctx.select_tab_at_index(0);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab2 => ctx.window().select_tab_at_index(1),
+            Action::SelectTab2 => {
+                ctx.window().select_tab_at_index(1);
+                ctx.select_tab_at_index(1);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab3 => ctx.window().select_tab_at_index(2),
+            Action::SelectTab3 => {
+                ctx.window().select_tab_at_index(2);
+                ctx.select_tab_at_index(2);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab4 => ctx.window().select_tab_at_index(3),
+            Action::SelectTab4 => {
+                ctx.window().select_tab_at_index(3);
+                ctx.select_tab_at_index(3);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab5 => ctx.window().select_tab_at_index(4),
+            Action::SelectTab5 => {
+                ctx.window().select_tab_at_index(4);
+                ctx.select_tab_at_index(4);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab6 => ctx.window().select_tab_at_index(5),
+            Action::SelectTab6 => {
+                ctx.window().select_tab_at_index(5);
+                ctx.select_tab_at_index(5);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab7 => ctx.window().select_tab_at_index(6),
+            Action::SelectTab7 => {
+                ctx.window().select_tab_at_index(6);
+                ctx.select_tab_at_index(6);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab8 => ctx.window().select_tab_at_index(7),
+            Action::SelectTab8 => {
+                ctx.window().select_tab_at_index(7);
+                ctx.select_tab_at_index(7);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectTab9 => ctx.window().select_tab_at_index(8),
+            Action::SelectTab9 => {
+                ctx.window().select_tab_at_index(8);
+                ctx.select_tab_at_index(8);
+            },
             #[cfg(target_os = "macos")]
-            Action::SelectLastTab => ctx.window().select_last_tab(),
+            Action::SelectLastTab => {
+                ctx.window().select_last_tab();
+                ctx.select_tab_at_index(ctx.tab_count().saturating_sub(1));
+            },
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectNextTab => ctx.select_next_tab(),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectPreviousTab => ctx.select_previous_tab(),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab1 => ctx.select_tab_at_index(0),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab2 => ctx.select_tab_at_index(1),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab3 => ctx.select_tab_at_index(2),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab4 => ctx.select_tab_at_index(3),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab5 => ctx.select_tab_at_index(4),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab6 => ctx.select_tab_at_index(5),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab7 => ctx.select_tab_at_index(6),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab8 => ctx.select_tab_at_index(7),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectTab9 => ctx.select_tab_at_index(8),
+            #[cfg(not(target_os = "macos"))]
+            Action::SelectLastTab => ctx.select_tab_at_index(ctx.tab_count().saturating_sub(1)),
+            Action::CreateTab => ctx.create_tab(),
+            Action::CloseTab => ctx.close_tab(),
+            Action::ToggleTabBar => ctx.toggle_tab_bar(),
             _ => (),
         }
     }

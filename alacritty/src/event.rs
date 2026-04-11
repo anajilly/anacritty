@@ -287,6 +287,9 @@ impl ApplicationHandler<Event> for Processor {
             info!(target: LOG_TARGET_WINIT, "{event:?}");
         }
 
+        // Preserve tab_id before destructuring the event.
+        let tab_id = event.tab_id;
+
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
             // Process IPC config update.
@@ -415,28 +418,78 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                // Remove the closed terminal.
-                let window_context = match self.windows.entry(*window_id) {
-                    // Don't exit when terminal exits if user asked to hold the window.
-                    Entry::Occupied(window_context)
-                        if !window_context.get().display.window.hold =>
-                    {
-                        window_context.remove()
-                    },
-                    _ => return,
-                };
-
-                // Unschedule pending events.
-                self.scheduler.unschedule_window(window_context.id());
-
-                // Shutdown if no more terminals are open.
-                if self.windows.is_empty() && !self.cli_options.daemon {
-                    // Write ref tests of last window to disk.
-                    if self.config.debug.ref_test {
-                        window_context.write_ref_test_results();
+                let hold = self.windows.get(window_id).is_some_and(|wc| wc.display.window.hold);
+                if hold {
+                    return;
+                }
+                if let Entry::Occupied(mut entry) = self.windows.entry(*window_id) {
+                    entry.get_mut().close_tab_by_id(tab_id);
+                    if entry.get().tabs.is_empty() {
+                        let window_context = entry.remove();
+                        self.scheduler.unschedule_window(window_context.id());
+                        if self.windows.is_empty() && !self.cli_options.daemon {
+                            if self.config.debug.ref_test {
+                                window_context.write_ref_test_results();
+                            }
+                            event_loop.exit();
+                        }
                     }
-
-                    event_loop.exit();
+                }
+            },
+            // Create a new in-window tab.
+            (EventType::CreateTab(window_id), _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    wc.create_tab(self.proxy.clone());
+                }
+            },
+            // Close a specific tab by ID.
+            (EventType::CloseTab(window_id, tab_id_to_close), _) => {
+                if let Entry::Occupied(mut entry) = self.windows.entry(window_id) {
+                    entry.get_mut().close_tab_by_id(tab_id_to_close);
+                    if entry.get().tabs.is_empty() {
+                        let wc = entry.remove();
+                        self.scheduler.unschedule_window(wc.id());
+                        if self.windows.is_empty() && !self.cli_options.daemon {
+                            event_loop.exit();
+                        }
+                    }
+                }
+            },
+            // Select a tab by index.
+            (EventType::SelectTab(window_id, tab_index), _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    wc.select_tab(tab_index);
+                    if wc.display.window.has_frame {
+                        wc.display.window.request_redraw();
+                    } else {
+                        wc.dirty = true;
+                    }
+                }
+            },
+            // Toggle tab bar visibility.
+            (EventType::ToggleTabBar(window_id), _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    wc.tab_bar_hidden = !wc.tab_bar_hidden;
+                    wc.dirty = true;
+                    wc.display.pending_update.dirty = true;
+                }
+            },
+            // Reorder tabs within a window.
+            (EventType::ReorderTab(window_id, from, to), _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    wc.reorder_tab(from, to);
+                }
+            },
+            // Update title for a specific tab.
+            (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
+                if let Some(wc) = self.windows.get_mut(window_id) {
+                    wc.update_tab_title(tab_id, title);
+                }
+            },
+            // Reset title for a specific tab.
+            (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
+                if let Some(wc) = self.windows.get_mut(window_id) {
+                    wc.reset_tab_title(tab_id);
                 }
             },
             // NOTE: This event bypasses batching to minimize input latency.
@@ -522,13 +575,22 @@ pub struct Event {
     /// Limit event to a specific window.
     window_id: Option<WindowId>,
 
+    /// Identify which tab within the window sent this event (0 when not tab-specific).
+    pub tab_id: usize,
+
     /// Event payload.
     payload: EventType,
 }
 
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
-        Self { window_id: window_id.into(), payload }
+        Self { window_id: window_id.into(), tab_id: 0, payload }
+    }
+
+    /// Builder to attach a tab identifier to this event.
+    pub fn with_tab_id(mut self, tab_id: usize) -> Self {
+        self.tab_id = tab_id;
+        self
     }
 }
 
@@ -556,6 +618,16 @@ pub enum EventType {
     #[cfg(unix)]
     Shutdown,
     Frame,
+    /// Create a new in-window tab.
+    CreateTab(WindowId),
+    /// Close a tab by its stable ID.
+    CloseTab(WindowId, usize),
+    /// Select the tab at a specific index.
+    SelectTab(WindowId, usize),
+    /// Toggle the tab bar visibility.
+    ToggleTabBar(WindowId),
+    /// Reorder a tab from one index to another.
+    ReorderTab(WindowId, usize, usize),
 }
 
 impl From<TerminalEvent> for EventType {
@@ -685,6 +757,12 @@ pub struct ActionContext<'a, N, T> {
     pub master_fd: RawFd,
     #[cfg(not(windows))]
     pub shell_pid: u32,
+    /// Number of tabs in this window.
+    pub tabs_len: usize,
+    /// Current active tab index (read-only snapshot).
+    pub active_tab_index: usize,
+    /// Stable ID of the active tab (for close/event operations).
+    pub active_tab_id: usize,
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -900,6 +978,56 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         let _ = self
             .event_proxy
             .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+    }
+
+    fn create_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::CreateTab(window_id), window_id));
+    }
+
+    fn close_tab(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(
+            EventType::CloseTab(window_id, self.active_tab_id),
+            window_id,
+        ));
+    }
+
+    fn select_next_tab(&mut self) {
+        if self.tabs_len == 0 {
+            return;
+        }
+        let next = (self.active_tab_index + 1) % self.tabs_len;
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectTab(window_id, next), window_id));
+    }
+
+    fn select_previous_tab(&mut self) {
+        if self.tabs_len == 0 {
+            return;
+        }
+        let prev =
+            if self.active_tab_index == 0 { self.tabs_len - 1 } else { self.active_tab_index - 1 };
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::SelectTab(window_id, prev), window_id));
+    }
+
+    fn select_tab_at_index(&mut self, index: usize) {
+        if index < self.tabs_len {
+            let window_id = self.display.window.id();
+            let _ = self
+                .event_proxy
+                .send_event(Event::new(EventType::SelectTab(window_id, index), window_id));
+        }
+    }
+
+    fn tab_count(&self) -> usize {
+        self.tabs_len
+    }
+
+    fn toggle_tab_bar(&mut self) {
+        let window_id = self.display.window.id();
+        let _ = self.event_proxy.send_event(Event::new(EventType::ToggleTabBar(window_id), window_id));
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -1933,7 +2061,12 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
-                | EventType::Frame => (),
+                | EventType::Frame
+                | EventType::CreateTab(_)
+                | EventType::CloseTab(_, _)
+                | EventType::SelectTab(_, _)
+                | EventType::ToggleTabBar(_)
+                | EventType::ReorderTab(_, _, _) => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -2073,21 +2206,29 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
 pub struct EventProxy {
     proxy: EventLoopProxy<Event>,
     window_id: WindowId,
+    tab_id: usize,
 }
 
 impl EventProxy {
+    #[allow(dead_code)]
     pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+        Self { proxy, window_id, tab_id: 0 }
+    }
+
+    /// Create a proxy tied to a specific tab.
+    pub fn new_with_tab(proxy: EventLoopProxy<Event>, window_id: WindowId, tab_id: usize) -> Self {
+        Self { proxy, window_id, tab_id }
     }
 
     /// Send an event to the event loop.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let _ = self.proxy.send_event(Event::new(event, self.window_id).with_tab_id(self.tab_id));
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let _ = self.proxy
+            .send_event(Event::new(event.into(), self.window_id).with_tab_id(self.tab_id));
     }
 }

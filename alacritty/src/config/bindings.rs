@@ -223,6 +223,15 @@ pub enum Action {
     /// Create new window in a tab.
     CreateNewTab,
 
+    /// Create a new in-window tab.
+    CreateTab,
+
+    /// Close the current in-window tab.
+    CloseTab,
+
+    /// Toggle the tab bar visibility.
+    ToggleTabBar,
+
     /// Toggle fullscreen.
     ToggleFullscreen,
 
@@ -558,6 +567,20 @@ fn common_keybindings() -> Vec<KeyBinding> {
         "-",    ModifiersState::CONTROL;                                                                 Action::DecreaseFontSize;
         "+" => KeyLocation::Numpad, ModifiersState::CONTROL;                                             Action::IncreaseFontSize;
         "-" => KeyLocation::Numpad, ModifiersState::CONTROL;                                             Action::DecreaseFontSize;
+        "t",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CreateTab;
+        "w",    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::CloseTab;
+        Tab,    ModifiersState::CONTROL;                                                                 Action::SelectNextTab;
+        Tab,    ModifiersState::CONTROL | ModifiersState::SHIFT;                                         Action::SelectPreviousTab;
+        "1",    ModifiersState::ALT;                                                                     Action::SelectTab1;
+        "2",    ModifiersState::ALT;                                                                     Action::SelectTab2;
+        "3",    ModifiersState::ALT;                                                                     Action::SelectTab3;
+        "4",    ModifiersState::ALT;                                                                     Action::SelectTab4;
+        "5",    ModifiersState::ALT;                                                                     Action::SelectTab5;
+        "6",    ModifiersState::ALT;                                                                     Action::SelectTab6;
+        "7",    ModifiersState::ALT;                                                                     Action::SelectTab7;
+        "8",    ModifiersState::ALT;                                                                     Action::SelectTab8;
+        "9",    ModifiersState::ALT;                                                                     Action::SelectLastTab;
+        "t",    ModifiersState::ALT     | ModifiersState::SHIFT;                                         Action::ToggleTabBar;
     )
 }
 

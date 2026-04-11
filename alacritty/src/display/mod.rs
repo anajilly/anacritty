@@ -655,6 +655,8 @@ impl Display {
         message_buffer: &MessageBuffer,
         search_state: &mut SearchState,
         config: &UiConfig,
+        tab_count: usize,
+        tab_bar_hidden: bool,
     ) where
         T: EventListener,
     {
@@ -703,16 +705,24 @@ impl Display {
         let search_active = search_state.history_index.is_some();
         let message_bar_lines = message_buffer.message().map_or(0, |m| m.text(&new_size).len());
         let search_lines = usize::from(search_active);
-        new_size.reserve_lines(message_bar_lines + search_lines);
+        let tab_bar_lines = usize::from(tab_count > 1 && !tab_bar_hidden);
+        new_size.reserve_lines(message_bar_lines + search_lines + tab_bar_lines);
 
         // Update resize increments.
         if config.window.resize_increments {
             self.window.set_resize_increments(PhysicalSize::new(cell_width, cell_height));
         }
 
-        // Resize when terminal when its dimensions have changed.
+        // Resize terminal when its dimensions have changed.
+        //
+        // Also check the terminal's own screen_lines in case the display's size_info was already
+        // updated by a previous tab's handle_update call but the current terminal (belonging to a
+        // different tab that wasn't active then) was never resized to match.
+        let terminal_needs_resize = terminal.screen_lines() != new_size.screen_lines()
+            || terminal.columns() != new_size.columns();
         if self.size_info.screen_lines() != new_size.screen_lines
             || self.size_info.columns() != new_size.columns()
+            || terminal_needs_resize
         {
             // Resize PTY.
             pty_resize_handle.on_resize(new_size.into());
@@ -779,6 +789,9 @@ impl Display {
         message_buffer: &MessageBuffer,
         config: &UiConfig,
         search_state: &mut SearchState,
+        tab_titles: &[String],
+        active_tab: usize,
+        tab_bar_hidden: bool,
     ) {
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
@@ -1006,6 +1019,14 @@ impl Display {
         } else {
             // Draw rectangles.
             self.renderer.draw_rects(&size_info, &metrics, rects);
+        }
+
+        // Draw the tab bar at the very bottom of the reserved area (on top of message bar).
+        if !tab_bar_hidden && tab_titles.len() > 1 {
+            let search_offset = usize::from(search_state.regex().is_some());
+            let msg_line_count = message_buffer.message().map_or(0, |m| m.text(&size_info).len());
+            let tab_bar_line = size_info.screen_lines() + search_offset + msg_line_count;
+            self.draw_tab_bar(config, tab_titles, active_tab, tab_bar_line);
         }
 
         self.draw_render_timer(config);
@@ -1300,6 +1321,73 @@ impl Display {
             self.damage_tracker.next_frame().damage_line(damage);
 
             self.renderer.draw_string(point, fg, bg, uri, &self.size_info, &mut self.glyph_cache);
+        }
+    }
+
+    /// Draw the tab bar showing all open tabs.
+    #[inline(never)]
+    fn draw_tab_bar(
+        &mut self,
+        config: &UiConfig,
+        tab_titles: &[String],
+        active_tab: usize,
+        start_line: usize,
+    ) {
+        let size_info = self.size_info;
+        let metrics = self.glyph_cache.font_metrics();
+
+        let bg = config.colors.footer_bar_background();
+        let fg = config.colors.footer_bar_foreground();
+
+        // Draw background for the entire tab bar row.
+        let y = size_info.cell_height().mul_add(start_line as f32, size_info.padding_y());
+        let bar_rect =
+            RenderRect::new(0., y, size_info.width(), size_info.cell_height(), bg, 1.);
+        self.renderer.draw_rects(&size_info, &metrics, vec![bar_rect]);
+
+        // Damage the tab bar area.
+        let width = size_info.width() as i32;
+        let height = size_info.cell_height() as i32;
+        self.damage_tracker.frame().add_viewport_rect(&size_info, 0, y as i32, width, height);
+        self.damage_tracker
+            .next_frame()
+            .add_viewport_rect(&size_info, 0, y as i32, width, height);
+
+        // Divide the tab bar evenly among all tabs.
+        let tab_count = tab_titles.len();
+        let total_cols = size_info.columns();
+        let tab_width = (total_cols / tab_count).max(1);
+
+        let glyph_cache = &mut self.glyph_cache;
+        for (i, title) in tab_titles.iter().enumerate() {
+            let col_start = i * tab_width;
+            let this_tab_width = if i == tab_count - 1 {
+                total_cols.saturating_sub(col_start)
+            } else {
+                tab_width
+            };
+
+            let (tab_fg, tab_bg) = if i == active_tab {
+                // Active tab: swap foreground/background for a visual highlight.
+                (bg, fg)
+            } else {
+                (fg, bg)
+            };
+
+            // Truncate title and pad to tab width.
+            let max_chars = this_tab_width.saturating_sub(2).max(1);
+            let display_title: String = title.chars().take(max_chars).collect();
+            let padded = format!("{display_title:<this_tab_width$}");
+
+            let point = Point::new(start_line, Column(col_start));
+            self.renderer.draw_string(
+                point,
+                tab_fg,
+                tab_bg,
+                padded.chars(),
+                &size_info,
+                glyph_cache,
+            );
         }
     }
 
