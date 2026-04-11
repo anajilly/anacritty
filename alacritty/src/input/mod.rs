@@ -151,6 +151,16 @@ pub trait ActionContext<T: EventListener> {
     fn select_tab_at_index(&mut self, _index: usize) {}
     fn tab_count(&self) -> usize { 1 }
     fn toggle_tab_bar(&mut self) {}
+    /// Return the tab index under the mouse, if the mouse is over the tab bar.
+    fn tab_bar_hit_test(&self) -> Option<usize> { None }
+    /// Return true while a tab drag is in progress.
+    fn is_tab_dragging(&self) -> bool { false }
+    /// Begin a potential drag on the tab at `tab_index` starting at pixel `start_x`.
+    fn press_tab_at(&mut self, _tab_index: usize, _start_x: f32) {}
+    /// Update the in-progress drag to the new raw pixel position.
+    fn update_tab_drag(&mut self, _x: f32, _y: f32) {}
+    /// Finalise the drag; `x` and `y` are the clamped mouse coordinates.
+    fn release_tab_drag(&mut self, _x: usize, _y: usize) {}
 }
 
 impl Action {
@@ -535,10 +545,18 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         let display_offset = self.ctx.terminal().grid().display_offset();
         let old_point = self.ctx.mouse().point(&size_info, display_offset);
 
+        let x_raw = x;
+        let y_raw = y;
         let x = x.clamp(0, size_info.width() as i32 - 1) as usize;
         let y = y.clamp(0, size_info.height() as i32 - 1) as usize;
         self.ctx.mouse_mut().x = x;
         self.ctx.mouse_mut().y = y;
+
+        // While a tab drag is active, update drag position and skip normal processing.
+        if self.ctx.is_tab_dragging() {
+            self.ctx.update_tab_drag(x_raw as f32, y_raw as f32);
+            return;
+        }
 
         let inside_text_area = size_info.contains_point(x, y);
         let cell_side = self.cell_side(x);
@@ -1061,6 +1079,21 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             MouseButton::Middle => self.ctx.mouse_mut().middle_button_state = state,
             MouseButton::Right => self.ctx.mouse_mut().right_button_state = state,
             _ => (),
+        }
+
+        // Intercept left clicks and releases for tab bar drag/click.
+        if button == MouseButton::Left {
+            if state == ElementState::Pressed {
+                if let Some(idx) = self.ctx.tab_bar_hit_test() {
+                    let start_x = self.ctx.mouse().x as f32;
+                    self.ctx.press_tab_at(idx, start_x);
+                    return;
+                }
+            } else if state == ElementState::Released && self.ctx.is_tab_dragging() {
+                let (x, y) = (self.ctx.mouse().x, self.ctx.mouse().y);
+                self.ctx.release_tab_drag(x, y);
+                return;
+            }
         }
 
         // Skip normal mouse events if the message bar has been clicked.

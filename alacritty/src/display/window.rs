@@ -232,6 +232,12 @@ impl Window {
         self.window.inner_size()
     }
 
+    /// Return the window's position on the screen in physical pixels.
+    #[inline]
+    pub fn outer_position(&self) -> winit::dpi::PhysicalPosition<i32> {
+        self.window.outer_position().unwrap_or_default()
+    }
+
     #[inline]
     pub fn set_visible(&self, visibility: bool) {
         self.window.set_visible(visibility);

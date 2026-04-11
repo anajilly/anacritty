@@ -399,6 +399,28 @@ pub struct Display {
     meter: Meter,
 }
 
+/// Compute per-tab column widths for variable-width, left-aligned tab rendering.
+///
+/// Each tab's desired width is `title.chars().count() + 2` (one margin character on each
+/// side).  If all tabs fit within `total_cols` at their desired width, those widths are
+/// returned unchanged and the tabs will *not* fill the full bar.  When the total desired
+/// width exceeds `total_cols`, every tab is capped at a fair equal share so that all tabs
+/// remain visible.
+pub(crate) fn compute_tab_widths(titles: &[String], total_cols: usize) -> Vec<usize> {
+    let n = titles.len();
+    if n == 0 {
+        return vec![];
+    }
+    let desired: Vec<usize> = titles.iter().map(|t| t.chars().count() + 2).collect();
+    let total_desired: usize = desired.iter().sum();
+    if total_desired <= total_cols {
+        desired
+    } else {
+        let fair = (total_cols / n).max(1);
+        desired.iter().map(|&d| d.min(fair).max(1)).collect()
+    }
+}
+
 impl Display {
     pub fn new(
         window: Window,
@@ -655,7 +677,7 @@ impl Display {
         message_buffer: &MessageBuffer,
         search_state: &mut SearchState,
         config: &UiConfig,
-        tab_count: usize,
+        _tab_count: usize,
         tab_bar_hidden: bool,
     ) where
         T: EventListener,
@@ -705,7 +727,7 @@ impl Display {
         let search_active = search_state.history_index.is_some();
         let message_bar_lines = message_buffer.message().map_or(0, |m| m.text(&new_size).len());
         let search_lines = usize::from(search_active);
-        let tab_bar_lines = usize::from(tab_count > 1 && !tab_bar_hidden);
+        let tab_bar_lines = usize::from(!tab_bar_hidden);
         new_size.reserve_lines(message_bar_lines + search_lines + tab_bar_lines);
 
         // Update resize increments.
@@ -792,6 +814,7 @@ impl Display {
         tab_titles: &[String],
         active_tab: usize,
         tab_bar_hidden: bool,
+        drag_visual: Option<(usize, f32)>,
     ) {
         // Collect renderable content before the terminal is dropped.
         let mut content = RenderableContent::new(config, self, &terminal, search_state);
@@ -1022,11 +1045,11 @@ impl Display {
         }
 
         // Draw the tab bar at the very bottom of the reserved area (on top of message bar).
-        if !tab_bar_hidden && tab_titles.len() > 1 {
+        if !tab_bar_hidden {
             let search_offset = usize::from(search_state.regex().is_some());
             let msg_line_count = message_buffer.message().map_or(0, |m| m.text(&size_info).len());
             let tab_bar_line = size_info.screen_lines() + search_offset + msg_line_count;
-            self.draw_tab_bar(config, tab_titles, active_tab, tab_bar_line);
+            self.draw_tab_bar(config, tab_titles, active_tab, tab_bar_line, drag_visual);
         }
 
         self.draw_render_timer(config);
@@ -1332,10 +1355,14 @@ impl Display {
         tab_titles: &[String],
         active_tab: usize,
         start_line: usize,
+        drag_visual: Option<(usize, f32)>,
     ) {
         let size_info = self.size_info;
         let metrics = self.glyph_cache.font_metrics();
 
+        // Tab bar uses footer_bar colors exclusively for simple theming:
+        //   inactive tab  →  normal:   fg text on bg fill
+        //   active tab    →  reversed: bg text on fg fill (bright)
         let bg = config.colors.footer_bar_background();
         let fg = config.colors.footer_bar_foreground();
 
@@ -1353,31 +1380,69 @@ impl Display {
             .next_frame()
             .add_viewport_rect(&size_info, 0, y as i32, width, height);
 
-        // Divide the tab bar evenly among all tabs.
         let tab_count = tab_titles.len();
         let total_cols = size_info.columns();
-        let tab_width = (total_cols / tab_count).max(1);
+
+        // Variable-width, left-aligned tabs: each tab is sized to its title plus at most
+        // one character of margin on each side.  Tabs do not fill the bar unless they
+        // collectively need the full width.
+        let tab_widths = compute_tab_widths(tab_titles, total_cols);
+
+        // Cumulative column start positions (left-aligned).
+        let col_starts: Vec<usize> = tab_widths
+            .iter()
+            .scan(0usize, |acc, &w| {
+                let s = *acc;
+                *acc += w;
+                Some(s)
+            })
+            .collect();
+
+        // Which tab slot does the current drag pointer fall over?
+        let drag_target = drag_visual.map(|(_, current_x)| {
+            let drop_col = ((current_x - size_info.padding_x()).max(0.0)
+                / size_info.cell_width()) as usize;
+            col_starts
+                .iter()
+                .zip(tab_widths.iter())
+                .enumerate()
+                .find(|&(_, (&start, &w))| drop_col < start + w)
+                .map(|(i, _)| i)
+                .unwrap_or(tab_count - 1)
+        });
+
+        // Track which tabs are rendered with the reversed (inverted) color scheme.
+        // Only the active tab and the tab currently being dragged are inverted.
+        let is_inverted: Vec<bool> = (0..tab_count)
+            .map(|i| {
+                i == active_tab
+                    || drag_visual.is_some_and(|(drag_idx, _)| i == drag_idx)
+            })
+            .collect();
 
         let glyph_cache = &mut self.glyph_cache;
         for (i, title) in tab_titles.iter().enumerate() {
-            let col_start = i * tab_width;
-            let this_tab_width = if i == tab_count - 1 {
-                total_cols.saturating_sub(col_start)
+            let col_start = col_starts[i];
+            let tab_width = tab_widths[i];
+
+            let is_drop_target = drag_target.is_some_and(|t| t == i)
+                && drag_visual.is_some_and(|(drag_idx, _)| drag_idx != i);
+            let _ = is_drop_target; // reserved for future visual indicator
+
+            let (tab_fg, tab_bg) = if is_inverted[i] {
+                (bg, fg) // reversed: bright fill, dark text
             } else {
-                tab_width
+                (fg, bg) // normal: dark fill, light text
             };
 
-            let (tab_fg, tab_bg) = if i == active_tab {
-                // Active tab: swap foreground/background for a visual highlight.
-                (bg, fg)
-            } else {
-                (fg, bg)
-            };
-
-            // Truncate title and pad to tab width.
-            let max_chars = this_tab_width.saturating_sub(2).max(1);
-            let display_title: String = title.chars().take(max_chars).collect();
-            let padded = format!("{display_title:<this_tab_width$}");
+            // Left-align the title with 1-char left margin; right-fill with spaces.
+            // In overflow (narrow tab), left margin may shrink to 0.
+            let (left_margin, title_space) =
+                if tab_width >= 2 { (1usize, tab_width - 1) } else { (0, tab_width) };
+            let truncated: String = title.chars().take(title_space).collect();
+            let right_fill = tab_width.saturating_sub(left_margin + truncated.chars().count());
+            let padded =
+                format!("{}{}{}", " ".repeat(left_margin), truncated, " ".repeat(right_fill));
 
             let point = Point::new(start_line, Column(col_start));
             self.renderer.draw_string(
@@ -1388,6 +1453,28 @@ impl Display {
                 &size_info,
                 glyph_cache,
             );
+        }
+
+        // Draw 1-pixel vertical dividers between adjacent tabs.
+        //
+        // Divider color by neighbor scheme:
+        //   normal | normal   → fg  (light line, visible on dark inactive backgrounds)
+        //   inverted | *      → bg  (dark line, visible against the bright inverted fill;
+        //                            at a normal/inverted boundary the fill-color contrast
+        //                            already creates a clear edge so bg blends quietly)
+        let divider_rects: Vec<RenderRect> = (1..tab_count)
+            .filter_map(|i| {
+                let col = col_starts[i];
+                if col >= total_cols {
+                    return None;
+                }
+                let color = if is_inverted[i - 1] || is_inverted[i] { bg } else { fg };
+                let div_x = size_info.padding_x() + col as f32 * size_info.cell_width();
+                Some(RenderRect::new(div_x, y, 1.0, size_info.cell_height(), color, 1.))
+            })
+            .collect();
+        if !divider_rects.is_empty() {
+            self.renderer.draw_rects(&size_info, &metrics, divider_rects);
         }
     }
 

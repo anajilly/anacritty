@@ -56,7 +56,7 @@ use crate::daemon::spawn_daemon;
 use crate::display::color::Rgb;
 use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
-use crate::display::{Display, Preedit, SizeInfo};
+use crate::display::{compute_tab_widths, Display, Preedit, SizeInfo};
 use crate::input::{self, ActionContext as _, FONT_SIZE_STEP};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
@@ -98,6 +98,8 @@ pub struct Processor {
     global_ipc_options: ParsedOptions,
     cli_options: CliOptions,
     config: Rc<UiConfig>,
+    /// Maps tab_id → owning WindowId; used to route terminal events after tab tear-off.
+    tab_registry: HashMap<usize, WindowId>,
 }
 
 impl Processor {
@@ -138,6 +140,7 @@ impl Processor {
             config: Rc::new(config),
             clipboard,
             windows: Default::default(),
+            tab_registry: Default::default(),
             #[cfg(unix)]
             global_ipc_options: Default::default(),
             config_monitor,
@@ -161,7 +164,11 @@ impl Processor {
         )?;
 
         self.gl_config = Some(window_context.display.gl_context().config());
-        self.windows.insert(window_context.id(), window_context);
+        let wid = window_context.id();
+        for tab in &window_context.tabs {
+            self.tab_registry.insert(tab.id, wid);
+        }
+        self.windows.insert(wid, window_context);
 
         Ok(())
     }
@@ -190,7 +197,11 @@ impl Processor {
             config_overrides,
         )?;
 
-        self.windows.insert(window_context.id(), window_context);
+        let wid = window_context.id();
+        for tab in &window_context.tabs {
+            self.tab_registry.insert(tab.id, wid);
+        }
+        self.windows.insert(wid, window_context);
         Ok(())
     }
 
@@ -410,7 +421,8 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (EventType::Terminal(TerminalEvent::Wakeup), Some(window_id)) => {
-                if let Some(window_context) = self.windows.get_mut(window_id) {
+                let wid = self.tab_registry.get(&tab_id).copied().unwrap_or(*window_id);
+                if let Some(window_context) = self.windows.get_mut(&wid) {
                     window_context.dirty = true;
                     if window_context.display.window.has_frame {
                         window_context.display.window.request_redraw();
@@ -418,12 +430,14 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (EventType::Terminal(TerminalEvent::Exit), Some(window_id)) => {
-                let hold = self.windows.get(window_id).is_some_and(|wc| wc.display.window.hold);
+                let wid = self.tab_registry.get(&tab_id).copied().unwrap_or(*window_id);
+                let hold = self.windows.get(&wid).is_some_and(|wc| wc.display.window.hold);
                 if hold {
                     return;
                 }
-                if let Entry::Occupied(mut entry) = self.windows.entry(*window_id) {
+                if let Entry::Occupied(mut entry) = self.windows.entry(wid) {
                     entry.get_mut().close_tab_by_id(tab_id);
+                    self.tab_registry.remove(&tab_id);
                     if entry.get().tabs.is_empty() {
                         let window_context = entry.remove();
                         self.scheduler.unschedule_window(window_context.id());
@@ -439,13 +453,15 @@ impl ApplicationHandler<Event> for Processor {
             // Create a new in-window tab.
             (EventType::CreateTab(window_id), _) => {
                 if let Some(wc) = self.windows.get_mut(&window_id) {
-                    wc.create_tab(self.proxy.clone());
+                    let new_tab_id = wc.create_tab(self.proxy.clone());
+                    self.tab_registry.insert(new_tab_id, window_id);
                 }
             },
             // Close a specific tab by ID.
             (EventType::CloseTab(window_id, tab_id_to_close), _) => {
                 if let Entry::Occupied(mut entry) = self.windows.entry(window_id) {
                     entry.get_mut().close_tab_by_id(tab_id_to_close);
+                    self.tab_registry.remove(&tab_id_to_close);
                     if entry.get().tabs.is_empty() {
                         let wc = entry.remove();
                         self.scheduler.unschedule_window(wc.id());
@@ -480,19 +496,173 @@ impl ApplicationHandler<Event> for Processor {
                     wc.reorder_tab(from, to);
                 }
             },
+            // Cross-window drop: find which window's tab bar is at the global position.
+            (EventType::TabDropAtGlobalPos(source_id, tab_index, global_x, global_y), _) => {
+                // Find a target window (other than the source) whose tab bar contains the point.
+                let target = self.windows.iter().find_map(|(wid, wc)| {
+                    if *wid == source_id {
+                        return None;
+                    }
+                    let outer = wc.display.window.outer_position();
+                    let local_x = global_x - outer.x as f32;
+                    let local_y = global_y - outer.y as f32;
+                    let size = wc.display.size_info;
+                    // Quick bounds check.
+                    if local_x < 0.0 || local_x >= size.width()
+                        || local_y < 0.0 || local_y >= size.height()
+                    {
+                        return None;
+                    }
+                    // Check if position is in the tab bar row.
+                    let tab_count = wc.tabs.len();
+                    let search_offset = usize::from(wc.tabs[wc.active_tab].search_state.history_index.is_some());
+                    let msg_lines = wc.message_buffer.message().map_or(0, |m| m.text(&size).len());
+                    let tab_bar_line = size.screen_lines() + search_offset + msg_lines;
+                    let tab_y = size.padding_y() + tab_bar_line as f32 * size.cell_height();
+                    let tab_y_end = tab_y + size.cell_height();
+                    if local_y < tab_y || local_y >= tab_y_end {
+                        return None;
+                    }
+                    // Compute which slot the drop lands in using variable-width layout.
+                    let titles: Vec<String> =
+                        wc.tabs.iter().map(|t| t.title.clone()).collect();
+                    let tab_widths = compute_tab_widths(&titles, size.columns());
+                    let drop_col =
+                        ((local_x - size.padding_x()).max(0.0) / size.cell_width()) as usize;
+                    let mut col = 0;
+                    let mut insert_before = tab_count;
+                    for (i, &w) in tab_widths.iter().enumerate() {
+                        col += w;
+                        if drop_col < col {
+                            insert_before = i;
+                            break;
+                        }
+                    }
+                    Some((*wid, insert_before))
+                });
+
+                let event = match target {
+                    Some((dst_wid, insert_before)) => {
+                        // Cross-window move: always allowed, even when source has only 1 tab.
+                        // The source window will be closed by MoveTabToWindow if it becomes empty.
+                        Some(Event::new(
+                            EventType::MoveTabToWindow(source_id, tab_index, dst_wid, insert_before),
+                            source_id,
+                        ))
+                    },
+                    None => {
+                        // Dropped into empty space: only tear off if the source has multiple tabs.
+                        // Tearing off the last tab would destroy the source window, which is
+                        // not allowed — the drag is silently cancelled instead.
+                        let src_tabs =
+                            self.windows.get(&source_id).map_or(0, |w| w.tabs.len());
+                        if src_tabs > 1 {
+                            Some(Event::new(
+                                EventType::TearOffTab(source_id, tab_index),
+                                source_id,
+                            ))
+                        } else {
+                            None
+                        }
+                    },
+                };
+                if let Some(event) = event {
+                    let _ = self.proxy.send_event(event);
+                }
+            },
+            // Move a tab from one window into another.
+            (EventType::MoveTabToWindow(source_id, tab_index, dst_id, insert_before), _) => {
+                // Extract the tab.
+                let tab = {
+                    let src = match self.windows.get_mut(&source_id) {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    if tab_index >= src.tabs.len() { return; }
+                    let t = src.tabs.remove(tab_index);
+                    if src.active_tab >= src.tabs.len() && !src.tabs.is_empty() {
+                        src.active_tab = src.tabs.len() - 1;
+                    }
+                    t
+                };
+                let moved_tab_id = tab.id;
+                // Insert into destination.
+                if let Some(dst) = self.windows.get_mut(&dst_id) {
+                    let insert_at = insert_before.min(dst.tabs.len());
+                    dst.tabs.insert(insert_at, tab);
+                    dst.select_tab(insert_at);
+                    dst.dirty = true;
+                    dst.display.pending_update.dirty = true;
+                    if dst.display.window.has_frame {
+                        dst.display.window.request_redraw();
+                    }
+                    self.tab_registry.insert(moved_tab_id, dst_id);
+                }
+                // Remove source if now empty.
+                if self.windows.get(&source_id).is_some_and(|w| w.tabs.is_empty()) {
+                    let wc = self.windows.remove(&source_id).unwrap();
+                    self.scheduler.unschedule_window(wc.id());
+                    if self.windows.is_empty() && !self.cli_options.daemon {
+                        event_loop.exit();
+                    }
+                } else if let Some(src) = self.windows.get_mut(&source_id) {
+                    src.dirty = true;
+                    src.display.pending_update.dirty = true;
+                }
+            },
+            // Tear off a tab into a new window.
+            (EventType::TearOffTab(source_id, tab_index), _) => {
+                for wc in self.windows.values_mut() {
+                    wc.display.make_not_current();
+                }
+                let tab = {
+                    let src = match self.windows.get_mut(&source_id) {
+                        Some(s) => s,
+                        None => return,
+                    };
+                    if tab_index >= src.tabs.len() {
+                        return;
+                    }
+                    let t = src.tabs.remove(tab_index);
+                    if src.active_tab >= src.tabs.len() && !src.tabs.is_empty() {
+                        src.active_tab = src.tabs.len() - 1;
+                    }
+                    t
+                };
+                let torn_tab_id = tab.id;
+                let gl_config = self.gl_config.as_ref().unwrap();
+                match WindowContext::additional_with_tab(gl_config, event_loop, self.config.clone(), tab) {
+                    Ok(new_wc) => {
+                        let new_wid = new_wc.id();
+                        self.tab_registry.insert(torn_tab_id, new_wid);
+                        self.windows.insert(new_wid, new_wc);
+                        if self.windows.get(&source_id).is_some_and(|w| w.tabs.is_empty()) {
+                            let wc = self.windows.remove(&source_id).unwrap();
+                            self.scheduler.unschedule_window(wc.id());
+                            if self.windows.is_empty() && !self.cli_options.daemon {
+                                event_loop.exit();
+                            }
+                        }
+                    },
+                    Err(e) => error!("tear-off failed: {e}"),
+                }
+            },
             // Update title for a specific tab.
             (EventType::Terminal(TerminalEvent::Title(title)), Some(window_id)) => {
-                if let Some(wc) = self.windows.get_mut(window_id) {
+                let wid = self.tab_registry.get(&tab_id).copied().unwrap_or(*window_id);
+                if let Some(wc) = self.windows.get_mut(&wid) {
                     wc.update_tab_title(tab_id, title);
                 }
             },
             // Reset title for a specific tab.
             (EventType::Terminal(TerminalEvent::ResetTitle), Some(window_id)) => {
-                if let Some(wc) = self.windows.get_mut(window_id) {
+                let wid = self.tab_registry.get(&tab_id).copied().unwrap_or(*window_id);
+                if let Some(wc) = self.windows.get_mut(&wid) {
                     wc.reset_tab_title(tab_id);
                 }
             },
             // NOTE: This event bypasses batching to minimize input latency.
+            // Frame is window-scoped (tab_id is always 0); use window_id directly.
             (EventType::Frame, Some(window_id)) => {
                 if let Some(window_context) = self.windows.get_mut(window_id) {
                     window_context.display.window.has_frame = true;
@@ -502,14 +672,21 @@ impl ApplicationHandler<Event> for Processor {
                 }
             },
             (payload, Some(window_id)) => {
-                if let Some(window_context) = self.windows.get_mut(window_id) {
+                // Terminal events may need to follow their tab after a tear-off.
+                // All other events (BlinkCursor, SearchNext, etc.) are window-scoped.
+                let wid = if matches!(payload, EventType::Terminal(_)) {
+                    self.tab_registry.get(&tab_id).copied().unwrap_or(*window_id)
+                } else {
+                    *window_id
+                };
+                if let Some(window_context) = self.windows.get_mut(&wid) {
                     window_context.handle_event(
                         #[cfg(target_os = "macos")]
                         event_loop,
                         &self.proxy,
                         &mut self.clipboard,
                         &mut self.scheduler,
-                        WinitEvent::UserEvent(Event::new(payload, *window_id)),
+                        WinitEvent::UserEvent(Event::new(payload, wid)),
                     );
                 }
             },
@@ -628,6 +805,13 @@ pub enum EventType {
     ToggleTabBar(WindowId),
     /// Reorder a tab from one index to another.
     ReorderTab(WindowId, usize, usize),
+    /// Tear off a tab to create a new window (source_window_id, tab_index).
+    TearOffTab(WindowId, usize),
+    /// Drop a dragged tab at a global screen position; Processor decides whether to
+    /// move to another window or tear off (source_wid, tab_index, global_x, global_y).
+    TabDropAtGlobalPos(WindowId, usize, f32, f32),
+    /// Move a tab from one window into another (src_wid, tab_index, dst_wid, insert_before).
+    MoveTabToWindow(WindowId, usize, WindowId, usize),
 }
 
 impl From<TerminalEvent> for EventType {
@@ -732,6 +916,16 @@ impl Default for InlineSearchState {
     }
 }
 
+/// State of a tab drag operation.
+#[derive(Default)]
+pub enum TabDragState {
+    #[default]
+    Idle,
+    Pressed { tab_index: usize, start_x: f32 },
+    /// `current_x` / `current_y` are raw (pre-clamp) pixel offsets from the window origin.
+    Dragging { tab_index: usize, current_x: f32, current_y: f32 },
+}
+
 pub struct ActionContext<'a, N, T> {
     pub notifier: &'a mut N,
     pub terminal: &'a mut Term<T>,
@@ -763,6 +957,12 @@ pub struct ActionContext<'a, N, T> {
     pub active_tab_index: usize,
     /// Stable ID of the active tab (for close/event operations).
     pub active_tab_id: usize,
+    /// State of any in-progress tab drag.
+    pub drag_state: &'a mut TabDragState,
+    /// Whether the tab bar is explicitly hidden.
+    pub tab_bar_hidden: bool,
+    /// Snapshot of all tab titles (used for variable-width hit-test and drag resolution).
+    pub tab_titles: &'a [String],
 }
 
 impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionContext<'a, N, T> {
@@ -1028,6 +1228,111 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     fn toggle_tab_bar(&mut self) {
         let window_id = self.display.window.id();
         let _ = self.event_proxy.send_event(Event::new(EventType::ToggleTabBar(window_id), window_id));
+    }
+
+    fn tab_bar_hit_test(&self) -> Option<usize> {
+        if self.tab_bar_hidden {
+            return None;
+        }
+        let size = self.display.size_info;
+        let search_offset = usize::from(self.search_state.history_index.is_some());
+        let msg_lines = self.message_buffer.message().map_or(0, |m| m.text(&size).len());
+        let tab_bar_line = size.screen_lines() + search_offset + msg_lines;
+        let tab_y = (size.padding_y() + tab_bar_line as f32 * size.cell_height()) as usize;
+        let tab_y_end = tab_y + size.cell_height() as usize;
+        if self.mouse.y < tab_y || self.mouse.y >= tab_y_end {
+            return None;
+        }
+        // Use variable-width layout so clicks land in the correct tab slot.
+        let tab_widths = compute_tab_widths(self.tab_titles, size.columns());
+        let x_col = ((self.mouse.x as f32 - size.padding_x()).max(0.0) / size.cell_width())
+            as usize;
+        let mut col = 0;
+        for (i, &w) in tab_widths.iter().enumerate() {
+            col += w;
+            if x_col < col {
+                return Some(i);
+            }
+        }
+        // Click is past all tabs (empty bar area) — no hit.
+        None
+    }
+
+    fn is_tab_dragging(&self) -> bool {
+        !matches!(self.drag_state, TabDragState::Idle)
+    }
+
+    fn press_tab_at(&mut self, tab_index: usize, start_x: f32) {
+        *self.drag_state = TabDragState::Pressed { tab_index, start_x };
+    }
+
+    fn update_tab_drag(&mut self, x: f32, y: f32) {
+        let new_state = match self.drag_state {
+            TabDragState::Pressed { tab_index, start_x } if (x - *start_x).abs() > 8.0 => {
+                Some(TabDragState::Dragging { tab_index: *tab_index, current_x: x, current_y: y })
+            },
+            TabDragState::Dragging { current_x, current_y, .. } => {
+                *current_x = x;
+                *current_y = y;
+                *self.dirty = true;
+                return;
+            },
+            _ => None,
+        };
+        if let Some(s) = new_state {
+            *self.drag_state = s;
+            *self.dirty = true;
+        }
+    }
+
+    fn release_tab_drag(&mut self, _x: usize, _y: usize) {
+        let drag = mem::replace(self.drag_state, TabDragState::Idle);
+        let wid = self.display.window.id();
+        match drag {
+            TabDragState::Pressed { tab_index, .. } => {
+                let _ = self.event_proxy.send_event(
+                    Event::new(EventType::SelectTab(wid, tab_index), wid),
+                );
+            },
+            TabDragState::Dragging { tab_index, current_x, current_y } => {
+                let size = self.display.size_info;
+                let within = current_x >= 0.0
+                    && current_x < size.width()
+                    && current_y >= 0.0
+                    && current_y < size.height();
+                if within {
+                    // Drop within this window: reorder using variable-width positions.
+                    let tab_widths = compute_tab_widths(self.tab_titles, size.columns());
+                    let drop_col = ((current_x - size.padding_x()).max(0.0)
+                        / size.cell_width()) as usize;
+                    let mut col = 0;
+                    let mut target = self.tabs_len - 1;
+                    for (i, &w) in tab_widths.iter().enumerate() {
+                        col += w;
+                        if drop_col < col {
+                            target = i;
+                            break;
+                        }
+                    }
+                    if target != tab_index {
+                        let _ = self.event_proxy.send_event(
+                            Event::new(EventType::ReorderTab(wid, tab_index, target), wid),
+                        );
+                    }
+                } else {
+                    // Drop outside this window: compute global coords and let Processor decide.
+                    // (The Processor will reject a tear-off when this is the last tab.)
+                    let outer = self.display.window.outer_position();
+                    let global_x = outer.x as f32 + current_x;
+                    let global_y = outer.y as f32 + current_y;
+                    let _ = self.event_proxy.send_event(
+                        Event::new(EventType::TabDropAtGlobalPos(wid, tab_index, global_x, global_y), wid),
+                    );
+                }
+                *self.dirty = true;
+            },
+            TabDragState::Idle => {},
+        }
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -2066,7 +2371,10 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::CloseTab(_, _)
                 | EventType::SelectTab(_, _)
                 | EventType::ToggleTabBar(_)
-                | EventType::ReorderTab(_, _, _) => (),
+                | EventType::ReorderTab(_, _, _)
+                | EventType::TearOffTab(_, _)
+                | EventType::TabDropAtGlobalPos(_, _, _, _)
+                | EventType::MoveTabToWindow(_, _, _, _) => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {

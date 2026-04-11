@@ -19,7 +19,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
-use alacritty_terminal::event::Event as TerminalEvent;
+use alacritty_terminal::event::{Event as TerminalEvent, OnResize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
 use alacritty_terminal::term::test::TermSize;
@@ -30,24 +30,13 @@ use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
 use crate::display::window::Window;
-use crate::event::{ActionContext, Event, EventProxy, Mouse, SearchState, TouchPurpose};
+use crate::event::{ActionContext, Event, EventProxy, Mouse, SearchState, TabDragState, TouchPurpose};
 #[cfg(unix)]
 use crate::logging::LOG_TARGET_IPC_CONFIG;
 use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
 use crate::tab::Tab;
 use crate::{input, renderer};
-
-/// State of a tab drag operation.
-#[derive(Default)]
-enum TabDragState {
-    #[default]
-    Idle,
-    #[allow(dead_code)]
-    Pressed { tab_index: usize, start_x: f32 },
-    #[allow(dead_code)]
-    Dragging { tab_index: usize, current_x: f32 },
-}
 
 /// Event context for one individual Alacritty window.
 pub struct WindowContext {
@@ -70,7 +59,6 @@ pub struct WindowContext {
     touch: TouchPurpose,
     occluded: bool,
     preserve_title: bool,
-    #[allow(dead_code)]
     drag_state: TabDragState,
     window_config: ParsedOptions,
     config: Rc<UiConfig>,
@@ -168,6 +156,77 @@ impl WindowContext {
         window_context.window_config = config_overrides;
 
         Ok(window_context)
+    }
+
+    /// Create a new window that starts with an existing tab (used for tab tear-off).
+    pub fn additional_with_tab(
+        gl_config: &GlutinConfig,
+        event_loop: &ActiveEventLoop,
+        config: Rc<UiConfig>,
+        tab: crate::tab::Tab,
+    ) -> Result<Self, Box<dyn Error>> {
+        let gl_display = gl_config.display();
+
+        let mut identity = config.window.identity.clone();
+        let mut options = WindowOptions::default();
+        options.window_identity.override_identity_config(&mut identity);
+
+        #[cfg(target_os = "macos")]
+        let tabbed = false;
+        #[cfg(not(target_os = "macos"))]
+        let tabbed = false;
+
+        let window = Window::new(
+            event_loop,
+            &config,
+            &identity,
+            &mut options,
+            #[cfg(all(feature = "x11", not(any(target_os = "macos", windows))))]
+            gl_config.x11_visual(),
+        )?;
+
+        let raw_window_handle = window.raw_window_handle();
+        let gl_context =
+            renderer::platform::create_gl_context(&gl_display, gl_config, Some(raw_window_handle))?;
+
+        let display = Display::new(window, gl_context, &config, tabbed)?;
+
+        info!(
+            "Tear-off window PTY dimensions: {:?} x {:?}",
+            display.size_info.screen_lines(),
+            display.size_info.columns()
+        );
+
+        let next_tab_id = tab.id + 1;
+        let tab_title = tab.title.clone();
+
+        let mut wc = WindowContext {
+            preserve_title: false,
+            display,
+            tabs: vec![tab],
+            active_tab: 0,
+            next_tab_id,
+            tab_bar_hidden: false,
+            drag_state: TabDragState::Idle,
+            config,
+            cursor_blink_timed_out: Default::default(),
+            prev_bell_cmd: Default::default(),
+            message_buffer: Default::default(),
+            window_config: Default::default(),
+            event_queue: Default::default(),
+            modifiers: Default::default(),
+            occluded: Default::default(),
+            mouse: Default::default(),
+            touch: Default::default(),
+            dirty: true,
+        };
+
+        // Set initial window title.
+        if wc.config.window.dynamic_title {
+            wc.display.window.set_title(tab_title);
+        }
+
+        Ok(wc)
     }
 
     /// Create a new terminal window context.
@@ -270,8 +329,8 @@ impl WindowContext {
         }
     }
 
-    /// Create a new tab in this window.
-    pub fn create_tab(&mut self, proxy: EventLoopProxy<Event>) {
+    /// Create a new tab in this window. Returns the new tab's stable ID.
+    pub fn create_tab(&mut self, proxy: EventLoopProxy<Event>) -> usize {
         let tab_id = self.next_tab_id;
         self.next_tab_id += 1;
         let window_id = self.display.window.id();
@@ -284,6 +343,7 @@ impl WindowContext {
             },
             Err(err) => error!("Could not create tab: {err:?}"),
         }
+        tab_id
     }
 
     /// Close the tab with the given stable ID.
@@ -317,7 +377,10 @@ impl WindowContext {
         if index >= self.tabs.len() {
             return;
         }
+        // Transfer focus state so the new tab's cursor renders correctly.
+        let was_focused = self.tabs[self.active_tab].terminal.lock().is_focused;
         self.active_tab = index;
+        self.tabs[self.active_tab].terminal.lock().is_focused = was_focused;
         // Force a full redraw for the new tab's content.
         self.display.damage_tracker.frame().mark_fully_damaged();
         self.dirty = true;
@@ -468,6 +531,10 @@ impl WindowContext {
         let active_idx = self.active_tab;
         let tab_bar_hidden = self.tab_bar_hidden;
         let tab_titles: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
+        let drag_visual = match &self.drag_state {
+            TabDragState::Dragging { tab_index, current_x, .. } => Some((*tab_index, *current_x)),
+            _ => None,
+        };
 
         // Lock the terminal through a local Arc clone to avoid borrow conflicts.
         let terminal_arc: Arc<alacritty_terminal::sync::FairMutex<alacritty_terminal::term::Term<crate::event::EventProxy>>> = Arc::clone(&self.tabs[active_idx].terminal);
@@ -482,6 +549,7 @@ impl WindowContext {
             &tab_titles,
             active_idx,
             tab_bar_hidden,
+            drag_visual,
         );
     }
 
@@ -522,6 +590,25 @@ impl WindowContext {
         let terminal_arc: Arc<alacritty_terminal::sync::FairMutex<alacritty_terminal::term::Term<crate::event::EventProxy>>> = Arc::clone(&self.tabs[active_idx].terminal);
         let mut terminal = terminal_arc.lock();
 
+        // Ensure the terminal's grid dimensions match the display before processing
+        // any input events. This can be stale when a tab is moved from a different-
+        // sized window (the terminal keeps the old window's dimensions until a resize
+        // event fires, but cursor_state() will index the grid using the new size_info
+        // and panic with an out-of-bounds assertion).
+        {
+            let current_size = self.display.size_info;
+            if terminal.screen_lines() != current_size.screen_lines()
+                || terminal.columns() != current_size.columns()
+            {
+                self.tabs[active_idx].notifier.on_resize(current_size.into());
+                terminal.resize(current_size);
+            }
+        }
+
+        // Snapshot tab titles before the mutable borrow of active_tab begins.
+        // Used by tab_bar_hit_test and release_tab_drag for variable-width layout.
+        let tab_titles: Vec<String> = self.tabs.iter().map(|t| t.title.clone()).collect();
+
         {
             // Single mutable borrow of the active tab; split into sub-field borrows.
             let active_tab = &mut self.tabs[active_idx];
@@ -554,6 +641,9 @@ impl WindowContext {
                 tabs_len,
                 active_tab_index: active_idx,
                 active_tab_id,
+                drag_state: &mut self.drag_state,
+                tab_bar_hidden: self.tab_bar_hidden,
+                tab_titles: &tab_titles,
             };
             let mut processor = input::Processor::new(context);
 
