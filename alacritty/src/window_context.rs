@@ -6,7 +6,13 @@ use std::io::Write;
 use std::mem;
 use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+/// Process-wide monotonically increasing tab ID counter. Ensures that tab IDs are
+/// unique across all windows within a process so the Processor's `tab_registry`
+/// (keyed by tab ID) never confuses tabs from different windows.
+static NEXT_TAB_ID: AtomicUsize = AtomicUsize::new(0);
 
 use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
@@ -49,8 +55,6 @@ pub struct WindowContext {
     pub tabs: Vec<Tab>,
     /// Index of the currently active tab.
     pub active_tab: usize,
-    /// Monotonically increasing ID counter for new tabs.
-    next_tab_id: usize,
     event_queue: Vec<WinitEvent<Event>>,
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
@@ -197,7 +201,6 @@ impl WindowContext {
             display.size_info.columns()
         );
 
-        let next_tab_id = tab.id + 1;
         let tab_title = tab.title.clone();
 
         let mut wc = WindowContext {
@@ -205,7 +208,6 @@ impl WindowContext {
             display,
             tabs: vec![tab],
             active_tab: 0,
-            next_tab_id,
             tab_bar_hidden: false,
             drag_state: TabDragState::Idle,
             config,
@@ -246,8 +248,9 @@ impl WindowContext {
 
         let window_id = display.window.id();
 
-        // Create the first tab (tab ID 0).
-        let first_tab = Tab::new(&display, &config, &options, proxy.clone(), window_id, 0)?;
+        // Create the first tab with a globally unique ID.
+        let first_tab_id = NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed);
+        let first_tab = Tab::new(&display, &config, &options, proxy.clone(), window_id, first_tab_id)?;
 
         // Start cursor blinking, in case `Focused` isn't sent on startup.
         if config.cursor.style().blinking {
@@ -260,7 +263,6 @@ impl WindowContext {
             display,
             tabs: vec![first_tab],
             active_tab: 0,
-            next_tab_id: 1,
             tab_bar_hidden: false,
             drag_state: TabDragState::Idle,
             config,
@@ -331,8 +333,7 @@ impl WindowContext {
 
     /// Create a new tab in this window. Returns the new tab's stable ID.
     pub fn create_tab(&mut self, proxy: EventLoopProxy<Event>) -> usize {
-        let tab_id = self.next_tab_id;
-        self.next_tab_id += 1;
+        let tab_id = NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed);
         let window_id = self.display.window.id();
         let options = WindowOptions::default();
         match Tab::new(&self.display, &self.config, &options, proxy, window_id, tab_id) {

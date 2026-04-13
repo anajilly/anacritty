@@ -135,6 +135,21 @@ impl Drop for TemporaryFiles {
 /// Creates a window, the terminal state, PTY, I/O event loop, input processor,
 /// config change monitor, and runs the main display loop.
 fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
+    // Single-instance mode: try to open the new window inside any already-running
+    // instance. find_socket() searches XDG_RUNTIME_DIR for Alacritty-{DISPLAY}-*.sock,
+    // auto-deletes orphan sockets, and returns Err when no live instance exists.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        let mut window_opts = options.window_options.clone();
+        window_opts.activation_token =
+            env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
+        if ipc::send_message(options.socket.clone(), SocketMessage::CreateWindow(window_opts))
+            .is_ok()
+        {
+            return Ok(()); // Existing instance will open the window; we're done.
+        }
+    }
+
     // Setup winit event loop.
     let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
 
