@@ -32,6 +32,8 @@ use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Term, TermMode};
 
 use crate::cli::{ParsedOptions, WindowOptions};
+#[cfg(not(windows))]
+use crate::daemon::foreground_process_path;
 use crate::clipboard::Clipboard;
 use crate::config::UiConfig;
 use crate::display::Display;
@@ -335,7 +337,14 @@ impl WindowContext {
     pub fn create_tab(&mut self, proxy: EventLoopProxy<Event>) -> usize {
         let tab_id = NEXT_TAB_ID.fetch_add(1, Ordering::Relaxed);
         let window_id = self.display.window.id();
-        let options = WindowOptions::default();
+        let mut options = WindowOptions::default();
+        #[cfg(not(windows))]
+        {
+            let active = self.active_tab();
+            if let Ok(cwd) = foreground_process_path(active.master_fd, active.shell_pid) {
+                options.terminal_options.working_directory = Some(cwd);
+            }
+        }
         match Tab::new(&self.display, &self.config, &options, proxy, window_id, tab_id) {
             Ok(tab) => {
                 self.tabs.push(tab);
