@@ -580,8 +580,11 @@ impl ApplicationHandler<Event> for Processor {
                     };
                     if tab_index >= src.tabs.len() { return; }
                     let t = src.tabs.remove(tab_index);
-                    if src.active_tab >= src.tabs.len() && !src.tabs.is_empty() {
-                        src.active_tab = src.tabs.len() - 1;
+                    if !src.tabs.is_empty() {
+                        if src.active_tab > tab_index {
+                            src.active_tab -= 1;
+                        }
+                        src.active_tab = src.active_tab.min(src.tabs.len() - 1);
                     }
                     t
                 };
@@ -624,8 +627,11 @@ impl ApplicationHandler<Event> for Processor {
                         return;
                     }
                     let t = src.tabs.remove(tab_index);
-                    if src.active_tab >= src.tabs.len() && !src.tabs.is_empty() {
-                        src.active_tab = src.tabs.len() - 1;
+                    if !src.tabs.is_empty() {
+                        if src.active_tab > tab_index {
+                            src.active_tab -= 1;
+                        }
+                        src.active_tab = src.active_tab.min(src.tabs.len() - 1);
                     }
                     t
                 };
@@ -1306,7 +1312,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
                     let drop_col = ((current_x - size.padding_x()).max(0.0)
                         / size.cell_width()) as usize;
                     let mut col = 0;
-                    let mut target = self.tabs_len - 1;
+                    let mut target = self.tabs_len.saturating_sub(1);
                     for (i, &w) in tab_widths.iter().enumerate() {
                         col += w;
                         if drop_col < col {

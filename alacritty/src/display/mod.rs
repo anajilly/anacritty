@@ -1408,7 +1408,7 @@ impl Display {
                 .enumerate()
                 .find(|&(_, (&start, &w))| drop_col < start + w)
                 .map(|(i, _)| i)
-                .unwrap_or(tab_count - 1)
+                .unwrap_or(tab_count.saturating_sub(1))
         });
 
         // Track which tabs are rendered with the reversed (inverted) color scheme.
