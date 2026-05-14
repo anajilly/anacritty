@@ -140,13 +140,15 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     // auto-deletes orphan sockets, and returns Err when no live instance exists.
     #[cfg(not(any(target_os = "macos", windows)))]
     {
-        let mut window_opts = options.window_options.clone();
-        window_opts.activation_token =
-            env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
-        if ipc::send_message(options.socket.clone(), SocketMessage::CreateWindow(window_opts))
-            .is_ok()
-        {
-            return Ok(()); // Existing instance will open the window; we're done.
+        if !options.daemon {
+            let mut window_opts = options.window_options.clone();
+            window_opts.activation_token =
+                env::var("XDG_ACTIVATION_TOKEN").or_else(|_| env::var("DESKTOP_STARTUP_ID")).ok();
+            if ipc::send_message(options.socket.clone(), SocketMessage::CreateWindow(window_opts))
+                .is_ok()
+            {
+                return Ok(()); // Existing instance will open the window; we're done.
+            }
         }
     }
 
