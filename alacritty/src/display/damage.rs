@@ -150,12 +150,16 @@ impl FrameDamage {
     /// Damage line for the given frame.
     #[inline]
     pub fn damage_line(&mut self, damage: LineDamageBounds) {
-        self.lines[damage.line].expand(damage.left, damage.right);
+        if let Some(line) = self.lines.get_mut(damage.line) {
+            line.expand(damage.left, damage.right);
+        }
     }
 
     #[inline]
     pub fn damage_point(&mut self, point: Point<usize>) {
-        self.lines[point.line].expand(point.column.0, point.column.0);
+        if let Some(line) = self.lines.get_mut(point.line) {
+            line.expand(point.column.0, point.column.0);
+        }
     }
 
     /// Mark the frame as fully damaged.
@@ -193,10 +197,12 @@ impl FrameDamage {
     /// Check if a range is damaged.
     #[inline]
     pub fn intersects(&self, start: Point<usize>, end: Point<usize>) -> bool {
-        let start_line = &self.lines[start.line];
-        let end_line = &self.lines[end.line];
-        self.full
-            || (start_line.left..=start_line.right).contains(&start.column)
+        if self.full {
+            return true;
+        }
+        let Some(start_line) = self.lines.get(start.line) else { return false };
+        let Some(end_line) = self.lines.get(end.line) else { return false };
+        (start_line.left..=start_line.right).contains(&start.column)
             || (end_line.left..=end_line.right).contains(&end.column)
             || (start.line + 1..end.line).any(|line| self.lines[line].is_damaged())
     }
