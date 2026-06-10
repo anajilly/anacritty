@@ -1081,6 +1081,14 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             _ => (),
         }
 
+        // On X11 the WM normally transfers keyboard focus when a window is clicked, but under
+        // unusual conditions (daemon-spawned windows, tab tear-off, long uptime) it can stop
+        // doing so. Explicitly requesting focus on every press ensures clicking any alacritty
+        // window always restores keyboard input. This is a no-op on Wayland.
+        if state == ElementState::Pressed {
+            self.ctx.window().focus_window();
+        }
+
         // Intercept left clicks and releases for tab bar drag/click.
         if button == MouseButton::Left {
             if state == ElementState::Pressed {

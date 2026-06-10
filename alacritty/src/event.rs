@@ -2440,6 +2440,9 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         // Reset the urgency hint when gaining focus.
                         if is_focused {
                             self.ctx.window().set_urgent(false);
+                            // Clear any stuck IME preedit — if composition was interrupted by a
+                            // focus change, the preedit can persist and silently swallow all keys.
+                            self.ctx.display.ime.set_preedit(None);
                         }
 
                         self.ctx.update_cursor_blinking();
