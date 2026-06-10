@@ -293,6 +293,13 @@ where
                                     error!("Error reading from PTY in event loop: {err}");
                                     break 'event_loop;
                                 }
+
+                                // After releasing the lease, yield so the main thread has a
+                                // chance to acquire terminal.lock() for rendering/input before
+                                // we re-enter pty_read() and reclaim the lease.  Without this,
+                                // a continuously-streaming PTY can starve the event loop under
+                                // heavy data load, making all keyboard input unresponsive.
+                                std::thread::yield_now();
                             }
 
                             if event.writable {
