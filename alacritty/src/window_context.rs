@@ -25,7 +25,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
 
-use alacritty_terminal::event::{Event as TerminalEvent, OnResize};
+use alacritty_terminal::event::{Event as TerminalEvent, Notify, OnResize};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::Direction;
 use alacritty_terminal::term::test::TermSize;
@@ -366,7 +366,13 @@ impl WindowContext {
             return;
         }
 
-        // Clamp active_tab to valid range.
+        // Keep active_tab pointing at the same logical tab after the removal.
+        // If the closed tab was before the active one, every subsequent tab shifted
+        // left by one, so we must decrement to compensate.  Then clamp in case the
+        // active tab itself was the one that closed (and it was the last tab).
+        if self.active_tab > idx {
+            self.active_tab -= 1;
+        }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
         }
@@ -387,10 +393,37 @@ impl WindowContext {
         if index >= self.tabs.len() {
             return;
         }
-        // Transfer focus state so the new tab's cursor renders correctly.
-        let was_focused = self.tabs[self.active_tab].terminal.lock().is_focused;
+        let old_idx = self.active_tab;
+
+        // Read focus state and clear it on the old tab in one lock.
+        let (was_focused, old_focus_events) = {
+            let mut t = self.tabs[old_idx].terminal.lock();
+            let focused = t.is_focused;
+            t.is_focused = false;
+            let events = t.mode().contains(TermMode::FOCUS_IN_OUT);
+            (focused, events)
+        };
+
+        // Notify the old tab that it lost focus, so programs like neovim can
+        // update their state (e.g. redraw unfocused cursor, stop blinking).
+        if was_focused && old_focus_events {
+            self.tabs[old_idx].notifier.notify(b"\x1b[O".as_slice());
+        }
+
         self.active_tab = index;
-        self.tabs[self.active_tab].terminal.lock().is_focused = was_focused;
+
+        // Set focus state on new tab and check whether it wants focus events.
+        let new_focus_events = {
+            let mut t = self.tabs[index].terminal.lock();
+            t.is_focused = was_focused;
+            t.mode().contains(TermMode::FOCUS_IN_OUT)
+        };
+
+        // Notify the new tab that it gained focus.
+        if was_focused && new_focus_events {
+            self.tabs[index].notifier.notify(b"\x1b[I".as_slice());
+        }
+
         // Force a full redraw for the new tab's content.
         self.display.damage_tracker.frame().mark_fully_damaged();
         self.dirty = true;
@@ -548,7 +581,26 @@ impl WindowContext {
 
         // Lock the terminal through a local Arc clone to avoid borrow conflicts.
         let terminal_arc: Arc<alacritty_terminal::sync::FairMutex<alacritty_terminal::term::Term<crate::event::EventProxy>>> = Arc::clone(&self.tabs[active_idx].terminal);
-        let terminal = terminal_arc.lock();
+        let mut terminal = terminal_arc.lock();
+
+        // Ensure the terminal matches the current display size before drawing.
+        // After a tab switch submit_display_update runs with the previous tab's terminal,
+        // so the newly-active terminal may still have stale dimensions; drawing it without
+        // resizing would make terminal.damage() yield line indices ≥ the damage tracker's
+        // len and panic in FrameDamage::damage_line.
+        {
+            let display_size = self.display.size_info;
+            if terminal.screen_lines() != display_size.screen_lines()
+                || terminal.columns() != display_size.columns()
+            {
+                self.tabs[active_idx].notifier.on_resize(display_size.into());
+                terminal.resize(display_size);
+                self.display.damage_tracker.resize(
+                    display_size.screen_lines(),
+                    display_size.columns(),
+                );
+            }
+        }
 
         self.display.draw(
             terminal,
