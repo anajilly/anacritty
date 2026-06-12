@@ -360,6 +360,9 @@ impl WindowContext {
     pub fn close_tab_by_id(&mut self, tab_id: usize) {
         let Some(idx) = self.tab_index_by_id(tab_id) else { return };
 
+        // Capture focus state before the tab is dropped.
+        let was_focused = self.tabs[idx].terminal.lock().is_focused;
+
         self.tabs.remove(idx);
 
         if self.tabs.is_empty() {
@@ -375,6 +378,20 @@ impl WindowContext {
         }
         if self.active_tab >= self.tabs.len() {
             self.active_tab = self.tabs.len() - 1;
+        }
+
+        // Transfer focus to the new active tab so the cursor renders correctly.
+        // select_tab() does this on user-initiated switches; we must do the same
+        // here for process-exit-driven tab removal.
+        if was_focused {
+            let new_focus_events = {
+                let mut t = self.tabs[self.active_tab].terminal.lock();
+                t.is_focused = true;
+                t.mode().contains(TermMode::FOCUS_IN_OUT)
+            };
+            if new_focus_events {
+                self.tabs[self.active_tab].notifier.notify(b"\x1b[I".as_slice());
+            }
         }
 
         // Mark display dirty and update window title.
