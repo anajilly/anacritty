@@ -450,6 +450,25 @@ impl ApplicationHandler<Event> for Processor {
                     }
                 }
             },
+            // Close an entire window: ask every tab's shell to exit, then let each tab
+            // close itself through the ordinary child-exit path below
+            // (`TerminalEvent::Exit`), exactly like Ctrl+D already does. That path is
+            // self-contained inside each tab's own PTY thread (SIGCHLD wakes it directly),
+            // unlike forcibly dropping a live `Tab`, which depends on a cross-thread
+            // channel wakeup that doesn't reliably tear down a still-running shell.
+            #[cfg(not(windows))]
+            (EventType::CloseWindow(window_id), _) => {
+                if let Some(wc) = self.windows.get_mut(&window_id) {
+                    // User asked to close the window, so no need to hold any tab open.
+                    wc.display.window.hold = false;
+                    for tab in &wc.tabs {
+                        unsafe { libc::kill(tab.shell_pid as libc::pid_t, libc::SIGHUP) };
+                    }
+                }
+            },
+            // Unused on Windows: `CloseRequested` there still calls `terminal.exit()` directly.
+            #[cfg(windows)]
+            (EventType::CloseWindow(_), _) => {},
             // Create a new in-window tab.
             (EventType::CreateTab(window_id), _) => {
                 if let Some(wc) = self.windows.get_mut(&window_id) {
@@ -818,6 +837,8 @@ pub enum EventType {
     TabDropAtGlobalPos(WindowId, usize, f32, f32),
     /// Move a tab from one window into another (src_wid, tab_index, dst_wid, insert_before).
     MoveTabToWindow(WindowId, usize, WindowId, usize),
+    /// Close an entire window and all of its tabs.
+    CloseWindow(WindowId),
 }
 
 impl From<TerminalEvent> for EventType {
@@ -2380,14 +2401,28 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 | EventType::ReorderTab(_, _, _)
                 | EventType::TearOffTab(_, _)
                 | EventType::TabDropAtGlobalPos(_, _, _, _)
-                | EventType::MoveTabToWindow(_, _, _, _) => (),
+                | EventType::MoveTabToWindow(_, _, _, _)
+                | EventType::CloseWindow(_) => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
                     WindowEvent::CloseRequested => {
-                        // User asked to close the window, so no need to hold it.
-                        self.ctx.window().hold = false;
-                        self.ctx.terminal.exit();
+                        // Close the whole window and every tab in it, not just the active
+                        // tab's terminal — this is the OS window-close button, not "close tab".
+                        #[cfg(not(windows))]
+                        {
+                            let window_id = self.ctx.display.window.id();
+                            let _ = self.ctx.event_proxy.send_event(Event::new(
+                                EventType::CloseWindow(window_id),
+                                window_id,
+                            ));
+                        }
+                        #[cfg(windows)]
+                        {
+                            // User asked to close the window, so no need to hold it.
+                            self.ctx.window().hold = false;
+                            self.ctx.terminal.exit();
+                        }
                     },
                     WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                         let old_scale_factor =
